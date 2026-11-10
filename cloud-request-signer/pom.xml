@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- Mule SDK parent: Mule APIs (provided) + mule-extensions-maven-plugin. Use the latest 1.x your build supports. -->
+    <parent>
+        <groupId>org.mule.extensions</groupId>
+        <artifactId>mule-modules-parent</artifactId>
+        <version>1.9.0</version>
+    </parent>
+
+    <!-- Must be your Anypoint organization (business group) ID to publish to Exchange. Same value in both projects. -->
+    <groupId>00000000-0000-0000-0000-000000000000</groupId>
+    <artifactId>cloud-request-signer</artifactId>
+    <version>1.0.0</version>
+    <packaging>mule-extension</packaging>
+    <name>Cloud Request Signer</name>
+    <description>Config-less Mule operations for the exact cryptographic steps: AWS SigV4 signing of S3 requests and Entra ID certificate client assertions.</description>
+
+    <properties>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <!-- The parent derives maven.compiler.release and the extension validation target from this.
+             Parent 1.9.0 implies minMuleVersion 4.9.0, which runs on Java 17+ only, so 11 is not possible here. -->
+        <java.release.version>17</java.release.version>
+        <!-- Same as mule-modules-parent 1.9.0: its extension-model plugin runs with this version, and older ones lack classes it needs -->
+        <mule.sdk.api.version>0.11.0</mule.sdk.api.version>
+        <junit.jupiter.version>5.10.2</junit.jupiter.version>
+    </properties>
+
+    <dependencies>
+        <!-- @JavaVersionSupport: needed to load on Java 17 runtimes -->
+        <dependency>
+            <groupId>org.mule.sdk</groupId>
+            <artifactId>mule-sdk-api</artifactId>
+            <version>${mule.sdk.api.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.jupiter.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <release>${maven.compiler.release}</release>
+                    <!-- the parent hardcodes ISO-8859-1, which garbles non-ASCII literals in UTF-8 sources -->
+                    <encoding>${project.build.sourceEncoding}</encoding>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
+                <configuration>
+                    <!-- Plain JUnit tests: replace the parent's JPMS argLine, whose module-path placeholders
+                         are never resolved in this project and make the forked test JVM fail to start. -->
+                    <argLine>-Dfile.encoding=UTF-8</argLine>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+    <repositories>
+        <repository>
+            <id>mulesoft-releases</id>
+            <url>https://repository.mulesoft.org/releases/</url>
+        </repository>
+    </repositories>
+    <pluginRepositories>
+        <pluginRepository>
+            <id>mulesoft-releases</id>
+            <url>https://repository.mulesoft.org/releases/</url>
+        </pluginRepository>
+    </pluginRepositories>
+
+    <distributionManagement>
+        <repository>
+            <id>anypoint-exchange-v3</id>
+            <name>Anypoint Exchange</name>
+            <url>https://maven.anypoint.mulesoft.com/api/v3/organizations/${project.groupId}/maven</url>
+            <layout>default</layout>
+        </repository>
+    </distributionManagement>
+</project>

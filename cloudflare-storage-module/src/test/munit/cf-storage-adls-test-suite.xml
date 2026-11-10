@@ -1,0 +1,417 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Exercises the module end to end on the ADLS path against a local fake of Entra ID and the
+    Cloudflare/Blob endpoint (both hosts are configurable, so no network is needed).
+    The S3 path is not covered here: the STS URL is fixed to https://sts.<region>.amazonaws.com.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+      xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:cf-storage="http://www.mulesoft.org/schema/mule/cf-storage"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+        http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/cf-storage http://www.mulesoft.org/schema/mule/cf-storage/current/mule-cf-storage.xsd">
+
+    <!-- fake.port is a free port picked by the munit plugin (dynamicPorts in pom.xml) -->
+    <munit:config name="cf-storage-adls-test-suite.xml"/>
+
+    <!-- ============================================================== module configs under test -->
+
+    <cf-storage:config name="adls" storageType="ADLS"
+                       gatewayHost="localhost" gatewayPort="${fake.port}" gatewayProtocol="HTTP"
+                       accessId="test-access-id" accessSecret="test-access-secret"
+                       tenantId="tenant-1" clientId="client-1" clientSecret="good-secret"
+                       authorityHost="http://localhost:${fake.port}"
+                       adlsAccount="acct" adlsContainer="files"/>
+
+    <cf-storage:config name="adls-wrong-gateway-secret" storageType="ADLS"
+                       gatewayHost="localhost" gatewayPort="${fake.port}" gatewayProtocol="HTTP"
+                       accessId="test-access-id" accessSecret="WRONG"
+                       tenantId="tenant-1" clientId="client-1" clientSecret="good-secret"
+                       authorityHost="http://localhost:${fake.port}"
+                       adlsAccount="acct" adlsContainer="files"/>
+
+    <cf-storage:config name="adls-wrong-client-secret" storageType="ADLS"
+                       gatewayHost="localhost" gatewayPort="${fake.port}" gatewayProtocol="HTTP"
+                       accessId="test-access-id" accessSecret="test-access-secret"
+                       tenantId="tenant-1" clientId="client-1" clientSecret="WRONG"
+                       authorityHost="http://localhost:${fake.port}"
+                       adlsAccount="acct" adlsContainer="files"/>
+
+    <cf-storage:config name="adls-missing-container" storageType="ADLS"
+                       gatewayHost="localhost" tenantId="tenant-1" clientId="client-1" clientSecret="s"
+                       adlsAccount="acct"/>
+
+    <cf-storage:config name="s3-missing-fields" storageType="S3"
+                       gatewayHost="localhost" tenantId="tenant-1" clientId="client-1"
+                       authMode="CERTIFICATE" region="ap-southeast-2"/>
+
+    <cf-storage:config name="unknown-storage-type" storageType="GCS"
+                       gatewayHost="localhost" tenantId="tenant-1" clientId="client-1" clientSecret="s"/>
+
+    <!-- ============================================================== fake Entra ID + Blob service -->
+
+    <http:listener-config name="fake-http">
+        <http:listener-connection host="localhost" port="${fake.port}"/>
+    </http:listener-config>
+
+    <os:object-store name="fake-blobs" persistent="false"/>
+
+    <flow name="fake-entra-token">
+        <http:listener config-ref="fake-http" path="/tenant-1/oauth2/v2.0/token" allowedMethods="POST">
+            <http:response statusCode="#[vars.status]"/>
+        </http:listener>
+        <set-variable variableName="form" value="#[payload]"/>
+        <choice>
+            <when expression="#[vars.form.client_secret == 'good-secret' and vars.form.client_id == 'client-1'
+                                and vars.form.grant_type == 'client_credentials' and vars.form.scope == 'https://storage.azure.com/.default']">
+                <set-variable variableName="status" value="#[200]"/>
+                <set-payload value='#[output application/json --- { token_type: "Bearer", expires_in: 3599, access_token: "fake-token" }]'/>
+            </when>
+            <otherwise>
+                <set-variable variableName="status" value="#[401]"/>
+                <set-payload value='#[output application/json --- { error: "invalid_client", error_description: "AADSTS7000215: Invalid client secret provided." }]'/>
+            </otherwise>
+        </choice>
+    </flow>
+
+    <flow name="fake-blob-service">
+        <http:listener config-ref="fake-http" path="/files/*">
+            <http:response statusCode="#[vars.status]">
+                <http:headers>#[vars.respHeaders]</http:headers>
+            </http:response>
+        </http:listener>
+        <set-variable variableName="blobKey" value="#[attributes.requestPath]"/>
+        <set-variable variableName="h" value="#[attributes.headers]"/>
+        <set-variable variableName="respHeaders" value="#[{ 'x-ms-request-id': 'req-1' }]"/>
+        <choice>
+            <!-- what Cloudflare does with a bad access secret: plain 403, no storage request id -->
+            <when expression="#[vars.h.cloudflareaccessid != 'test-access-id' or vars.h.cloudflareaccesssecret != 'test-access-secret']">
+                <set-variable variableName="status" value="#[403]"/>
+                <set-variable variableName="respHeaders" value="#[{}]"/>
+                <set-payload value="Forbidden"/>
+            </when>
+            <when expression="#[vars.h.authorization != 'Bearer fake-token' or vars.h.'x-ms-version' != '2021-08-06'
+                                or vars.h.cloudflarehostname != 'acct.blob.core.windows.net'
+                                or !(vars.h.'x-ms-date' default '' matches /\w{3}, \d{2} \w{3} \d{4} \d{2}:\d{2}:\d{2} GMT/)]">
+                <set-variable variableName="status" value="#[400]"/>
+                <set-variable variableName="respHeaders" value="#[vars.respHeaders ++ { 'x-ms-error-code': 'UnexpectedRequestHeaders' }]"/>
+                <set-payload value="#[write(vars.h, 'application/json')]"/>
+            </when>
+            <when expression="#[vars.blobKey startsWith '/files/denied/']">
+                <set-variable variableName="status" value="#[403]"/>
+                <set-variable variableName="respHeaders" value="#[vars.respHeaders ++ { 'x-ms-error-code': 'AuthorizationPermissionMismatch' }]"/>
+                <set-payload value="This request is not authorized to perform this operation using this permission."/>
+            </when>
+            <when expression="#[vars.blobKey startsWith '/files/expired/']">
+                <set-variable variableName="status" value="#[403]"/>
+                <set-variable variableName="respHeaders" value="#[vars.respHeaders ++ { 'x-ms-error-code': 'InvalidAuthenticationInfo' }]"/>
+                <set-payload value="Lifetime validation failed. The token is expired."/>
+            </when>
+            <when expression="#[vars.blobKey startsWith '/files/boom/']">
+                <set-variable variableName="status" value="#[500]"/>
+                <set-variable variableName="respHeaders" value="#[vars.respHeaders ++ { 'x-ms-error-code': 'InternalError' }]"/>
+                <set-payload value="Server failed to authenticate the request."/>
+            </when>
+            <when expression="#[attributes.method == 'PUT']">
+                <choice>
+                    <when expression="#[vars.h.'x-ms-blob-type' != 'BlockBlob']">
+                        <set-variable variableName="status" value="#[400]"/>
+                        <set-variable variableName="respHeaders" value="#[vars.respHeaders ++ { 'x-ms-error-code': 'MissingRequiredHeader' }]"/>
+                        <set-payload value="x-ms-blob-type"/>
+                    </when>
+                    <otherwise>
+                        <os:store key="#[vars.blobKey]" objectStore="fake-blobs">
+                            <os:value>#[output application/java --- {
+                                content: payload.^raw as String,
+                                contentType: vars.h.'content-type',
+                                meta: vars.h filterObject ((v, k) -> (k as String) startsWith 'x-ms-meta-')
+                            }]</os:value>
+                        </os:store>
+                        <set-variable variableName="status" value="#[201]"/>
+                        <set-variable variableName="respHeaders" value='#[vars.respHeaders ++ { etag: "\"etag-1\"" }]'/>
+                        <set-payload value=""/>
+                    </otherwise>
+                </choice>
+            </when>
+            <otherwise>
+                <os:contains key="#[vars.blobKey]" objectStore="fake-blobs" target="exists"/>
+                <choice>
+                    <when expression="#[not vars.exists]">
+                        <set-variable variableName="status" value="#[404]"/>
+                        <set-variable variableName="respHeaders" value="#[vars.respHeaders ++ { 'x-ms-error-code': 'BlobNotFound' }]"/>
+                        <set-payload value="The specified blob does not exist."/>
+                    </when>
+                    <when expression="#[attributes.method == 'DELETE']">
+                        <os:remove key="#[vars.blobKey]" objectStore="fake-blobs"/>
+                        <set-variable variableName="status" value="#[202]"/>
+                        <set-payload value=""/>
+                    </when>
+                    <otherwise>
+                        <os:retrieve key="#[vars.blobKey]" objectStore="fake-blobs" target="blob"/>
+                        <set-variable variableName="status" value="#[200]"/>
+                        <set-variable variableName="respHeaders" value='#[vars.respHeaders ++ vars.blob.meta ++ {
+                            etag: "\"etag-1\"", "last-modified": "Tue, 10 Nov 2026 09:30:00 GMT", "content-type": vars.blob.contentType }]'/>
+                        <set-payload value="#[vars.blob.content]"/>
+                    </otherwise>
+                </choice>
+            </otherwise>
+        </choice>
+    </flow>
+
+    <!-- ============================================================== tests -->
+
+    <munit:test name="adls-put-get-head-delete-round-trip"
+                description="Put stores the blob with metadata; get/head read it back; delete removes it; delete again still succeeds.">
+        <munit:enable-flow-sources>
+            <munit:enable-flow-source value="fake-entra-token"/>
+            <munit:enable-flow-source value="fake-blob-service"/>
+        </munit:enable-flow-sources>
+        <munit:execution>
+            <set-payload value="hello from munit" mimeType="text/plain"/>
+            <cf-storage:put-object config-ref="adls" key="/dir/a b+1.txt" contentType="text/plain"
+                                   userMetadata="#[{ source: 'munit' }]">
+                <cf-storage:content>#[payload]</cf-storage:content>
+            </cf-storage:put-object>
+            <set-variable variableName="put" value="#[payload]"/>
+            <cf-storage:get-object config-ref="adls" key="dir/a b+1.txt"/>
+            <set-variable variableName="got" value="#[payload.^raw as String]"/>
+            <cf-storage:head-object config-ref="adls" key="dir/a b+1.txt"/>
+            <set-variable variableName="head" value="#[payload]"/>
+            <cf-storage:delete-object config-ref="adls" key="dir/a b+1.txt"/>
+            <set-variable variableName="deleted" value="#[payload]"/>
+            <cf-storage:delete-object config-ref="adls" key="dir/a b+1.txt"/>
+            <set-variable variableName="deletedAgain" value="#[payload]"/>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.put.key]" expected="/dir/a b+1.txt"/>
+            <munit-tools:assert-equals actual="#[vars.put.eTag]" expected='#["\"etag-1\""]'/>
+            <munit-tools:assert-equals actual="#[vars.put.requestId]" expected="req-1"/>
+            <munit-tools:assert-equals actual="#[vars.put.storageType]" expected="ADLS"/>
+            <munit-tools:assert-equals actual="#[vars.got]" expected="hello from munit"/>
+            <munit-tools:assert-equals actual="#[vars.head.contentType]" expected="text/plain"/>
+            <munit-tools:assert-equals actual="#[vars.head.userMetadata]" expected="#[{ source: 'munit' }]"/>
+            <munit-tools:assert-equals actual="#[vars.head.lastModified]" expected="Tue, 10 Nov 2026 09:30:00 GMT"/>
+            <munit-tools:assert-equals actual="#[vars.deleted]" expected="#[{ key: 'dir/a b+1.txt', deleted: true, storageType: 'ADLS' }]"/>
+            <munit-tools:assert-equals actual="#[vars.deletedAgain.deleted]" expected="#[true]"/>
+        </munit:validation>
+    </munit:test>
+
+    <munit:test name="adls-key-is-uri-encoded-per-segment" description="The fake stores by raw request path; an encoded path must round-trip.">
+        <munit:enable-flow-sources>
+            <munit:enable-flow-source value="fake-entra-token"/>
+            <munit:enable-flow-source value="fake-blob-service"/>
+        </munit:enable-flow-sources>
+        <munit:execution>
+            <set-payload value="x" mimeType="text/plain"/>
+            <cf-storage:put-object config-ref="adls" key="enc/é ü#?.txt" contentType="text/plain">
+                <cf-storage:content>#[payload]</cf-storage:content>
+            </cf-storage:put-object>
+            <cf-storage:get-object config-ref="adls" key="enc/é ü#?.txt"/>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[payload.^raw as String]" expected="x"/>
+        </munit:validation>
+    </munit:test>
+
+    <munit:test name="adls-get-missing-raises-not-found" expectedErrorType="CF-STORAGE:NOT_FOUND">
+        <munit:enable-flow-sources>
+            <munit:enable-flow-source value="fake-entra-token"/>
+            <munit:enable-flow-source value="fake-blob-service"/>
+        </munit:enable-flow-sources>
+        <munit:execution>
+            <cf-storage:get-object config-ref="adls" key="does/not/exist.txt"/>
+        </munit:execution>
+    </munit:test>
+
+    <munit:test name="adls-head-missing-raises-not-found" expectedErrorType="CF-STORAGE:NOT_FOUND">
+        <munit:enable-flow-sources>
+            <munit:enable-flow-source value="fake-entra-token"/>
+            <munit:enable-flow-source value="fake-blob-service"/>
+        </munit:enable-flow-sources>
+        <munit:execution>
+            <cf-storage:head-object config-ref="adls" key="does/not/exist.txt"/>
+        </munit:execution>
+    </munit:test>
+
+    <munit:test name="adls-permission-mismatch-raises-access-denied" expectedErrorType="CF-STORAGE:ACCESS_DENIED">
+        <munit:enable-flow-sources>
+            <munit:enable-flow-source value="fake-entra-token"/>
+            <munit:enable-flow-source value="fake-blob-service"/>
+        </munit:enable-flow-sources>
+        <munit:execution>
+            <cf-storage:get-object config-ref="adls" key="denied/a.txt"/>
+        </munit:execution>
+    </munit:test>
+
+    <munit:test name="adls-expired-token-raises-invalid-credentials" expectedErrorType="CF-STORAGE:INVALID_CREDENTIALS">
+        <munit:enable-flow-sources>
+            <munit:enable-flow-source value="fake-entra-token"/>
+            <munit:enable-flow-source value="fake-blob-service"/>
+        </munit:enable-flow-sources>
+        <munit:execution>
+            <cf-storage:delete-object config-ref="adls" key="expired/a.txt"/>
+        </munit:execution>
+    </munit:test>
+
+    <munit:test name="adls-500-raises-server-error" expectedErrorType="CF-STORAGE:SERVER_ERROR">
+        <munit:enable-flow-sources>
+            <munit:enable-flow-source value="fake-entra-token"/>
+            <munit:enable-flow-source value="fake-blob-service"/>
+        </munit:enable-flow-sources>
+        <munit:execution>
+            <cf-storage:head-object config-ref="adls" key="boom/a.txt"/>
+        </munit:execution>
+    </munit:test>
+
+    <munit:test name="gateway-403-without-request-id-raises-gateway-rejected" expectedErrorType="CF-STORAGE:GATEWAY_REJECTED">
+        <munit:enable-flow-sources>
+            <munit:enable-flow-source value="fake-entra-token"/>
+            <munit:enable-flow-source value="fake-blob-service"/>
+        </munit:enable-flow-sources>
+        <munit:execution>
+            <cf-storage:get-object config-ref="adls-wrong-gateway-secret" key="a.txt"/>
+        </munit:execution>
+    </munit:test>
+
+    <munit:test name="entra-rejection-raises-authentication" expectedErrorType="CF-STORAGE:AUTHENTICATION">
+        <munit:enable-flow-sources>
+            <munit:enable-flow-source value="fake-entra-token"/>
+            <munit:enable-flow-source value="fake-blob-service"/>
+        </munit:enable-flow-sources>
+        <munit:execution>
+            <cf-storage:get-object config-ref="adls-wrong-client-secret" key="a.txt"/>
+        </munit:execution>
+    </munit:test>
+
+    <munit:test name="token-cache-is-not-shared-between-configs" expectedErrorType="CF-STORAGE:AUTHENTICATION"
+                description="A token cached by one config must not be reused by another config (different credentials).">
+        <munit:enable-flow-sources>
+            <munit:enable-flow-source value="fake-entra-token"/>
+            <munit:enable-flow-source value="fake-blob-service"/>
+        </munit:enable-flow-sources>
+        <munit:execution>
+            <try>
+                <cf-storage:get-object config-ref="adls" key="cache-check.txt"/>
+                <error-handler>
+                    <on-error-continue type="CF-STORAGE:NOT_FOUND"/>
+                </error-handler>
+            </try>
+            <cf-storage:get-object config-ref="adls-wrong-client-secret" key="cache-check.txt"/>
+        </munit:execution>
+    </munit:test>
+
+    <munit:test name="entra-rejection-message-includes-description">
+        <munit:enable-flow-sources>
+            <munit:enable-flow-source value="fake-entra-token"/>
+            <munit:enable-flow-source value="fake-blob-service"/>
+        </munit:enable-flow-sources>
+        <munit:execution>
+            <try>
+                <cf-storage:get-object config-ref="adls-wrong-client-secret" key="a.txt"/>
+                <error-handler>
+                    <on-error-continue type="CF-STORAGE:AUTHENTICATION">
+                        <set-payload value="#[error.description]"/>
+                    </on-error-continue>
+                </error-handler>
+            </try>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-that expression="#[payload]"
+                                     is="#[MunitTools::containsString('AADSTS7000215: Invalid client secret provided.')]"/>
+            <munit-tools:assert-that expression="#[payload]" is="#[MunitTools::containsString('HTTP 401')]"/>
+        </munit:validation>
+    </munit:test>
+
+    <munit:test name="key-with-dot-dot-segment-raises-bad-request" expectedErrorType="CF-STORAGE:BAD_REQUEST">
+        <munit:enable-flow-sources>
+            <munit:enable-flow-source value="fake-entra-token"/>
+            <munit:enable-flow-source value="fake-blob-service"/>
+        </munit:enable-flow-sources>
+        <munit:execution>
+            <cf-storage:get-object config-ref="adls" key="a/../b.txt"/>
+        </munit:execution>
+    </munit:test>
+
+    <munit:test name="key-with-trailing-slash-raises-bad-request" expectedErrorType="CF-STORAGE:BAD_REQUEST">
+        <munit:enable-flow-sources>
+            <munit:enable-flow-source value="fake-entra-token"/>
+            <munit:enable-flow-source value="fake-blob-service"/>
+        </munit:enable-flow-sources>
+        <munit:execution>
+            <cf-storage:delete-object config-ref="adls" key="folder/"/>
+        </munit:execution>
+    </munit:test>
+
+    <munit:test name="adls-invalid-metadata-name-raises-bad-request" expectedErrorType="CF-STORAGE:BAD_REQUEST">
+        <munit:enable-flow-sources>
+            <munit:enable-flow-source value="fake-entra-token"/>
+            <munit:enable-flow-source value="fake-blob-service"/>
+        </munit:enable-flow-sources>
+        <munit:execution>
+            <set-payload value="x" mimeType="text/plain"/>
+            <cf-storage:put-object config-ref="adls" key="a.txt" contentType="text/plain" userMetadata="#[{ 'bad-name': 'v' }]">
+                <cf-storage:content>#[payload]</cf-storage:content>
+            </cf-storage:put-object>
+        </munit:execution>
+    </munit:test>
+
+    <munit:test name="adls-config-missing-container-raises-configuration">
+        <munit:enable-flow-sources>
+            <munit:enable-flow-source value="fake-entra-token"/>
+            <munit:enable-flow-source value="fake-blob-service"/>
+        </munit:enable-flow-sources>
+        <munit:execution>
+            <try>
+                <cf-storage:head-object config-ref="adls-missing-container" key="a.txt"/>
+                <error-handler>
+                    <on-error-continue type="CF-STORAGE:CONFIGURATION">
+                        <set-payload value="#[error.description]"/>
+                    </on-error-continue>
+                </error-handler>
+            </try>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[payload]"
+                                       expected="Cloudflare Storage config: Missing for storage type ADLS: adlsContainer"/>
+        </munit:validation>
+    </munit:test>
+
+    <munit:test name="s3-config-lists-every-missing-field">
+        <munit:enable-flow-sources>
+            <munit:enable-flow-source value="fake-entra-token"/>
+            <munit:enable-flow-source value="fake-blob-service"/>
+        </munit:enable-flow-sources>
+        <munit:execution>
+            <try>
+                <cf-storage:get-object config-ref="s3-missing-fields" key="a.txt"/>
+                <error-handler>
+                    <on-error-continue type="CF-STORAGE:CONFIGURATION">
+                        <set-payload value="#[error.description]"/>
+                    </on-error-continue>
+                </error-handler>
+            </try>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[payload]"
+                                       expected="Cloudflare Storage config: Missing for storage type S3: certificateKeystore, certificateKeystorePassword, signingHost, roleArn, stsRegion"/>
+        </munit:validation>
+    </munit:test>
+
+    <munit:test name="unknown-storage-type-raises-configuration" expectedErrorType="CF-STORAGE:CONFIGURATION">
+        <munit:enable-flow-sources>
+            <munit:enable-flow-source value="fake-entra-token"/>
+            <munit:enable-flow-source value="fake-blob-service"/>
+        </munit:enable-flow-sources>
+        <munit:execution>
+            <cf-storage:get-object config-ref="unknown-storage-type" key="a.txt"/>
+        </munit:execution>
+    </munit:test>
+</mule>

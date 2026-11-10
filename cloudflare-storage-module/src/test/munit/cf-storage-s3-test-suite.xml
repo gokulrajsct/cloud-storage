@@ -1,0 +1,224 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Exercises the module end to end on the S3 path. The Entra ID and AWS STS calls (POST, fixed
+    https://sts.<region>.amazonaws.com URL) are mocked with one canned body that satisfies both parsers;
+    the signed S3 requests go to a local fake that checks the SigV4 headers and the body hash.
+-->
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+      xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:os="http://www.mulesoft.org/schema/mule/os"
+      xmlns:cf-storage="http://www.mulesoft.org/schema/mule/cf-storage"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+        http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+        http://www.mulesoft.org/schema/mule/cf-storage http://www.mulesoft.org/schema/mule/cf-storage/current/mule-cf-storage.xsd">
+
+    <!-- fake.port is a free port picked by the munit plugin (dynamicPorts in pom.xml) -->
+    <munit:config name="cf-storage-s3-test-suite.xml"/>
+
+    <cf-storage:config name="s3" storageType="S3"
+                       gatewayHost="localhost" gatewayPort="${fake.port}" gatewayProtocol="HTTP"
+                       accessId="test-access-id" accessSecret="test-access-secret"
+                       tenantId="tenant-1" clientId="client-1" clientSecret="good-secret"
+                       region="ap-southeast-2" signingHost="s3.ap-southeast-2.amazonaws.com" pathPrefix="/bucket"
+                       roleArn="arn:aws:iam::123456789012:role/test" stsRegion="ap-southeast-2"/>
+
+    <!-- MUnit loads all suites into one app: the "fake-http" listener config is the one in cf-storage-adls-test-suite.xml -->
+
+    <os:object-store name="fake-objects" persistent="false"/>
+
+    <flow name="fake-s3">
+        <http:listener config-ref="fake-http" path="/bucket/*">
+            <http:response statusCode="#[vars.status]">
+                <http:headers>#[vars.respHeaders]</http:headers>
+            </http:response>
+            <http:error-response statusCode="500">
+                <http:body>#["&lt;Error&gt;&lt;Code&gt;FakeFlowError&lt;/Code&gt;&lt;Message&gt;" ++ ((error.description default '') replace /[&lt;\n]/ with ' ') ++ "&lt;/Message&gt;&lt;/Error&gt;"]</http:body>
+                <http:headers>#[{ 'x-amz-request-id': 'REQ-ERR' }]</http:headers>
+            </http:error-response>
+        </http:listener>
+        <set-variable variableName="objectKey" value="#[attributes.requestPath]"/>
+        <set-variable variableName="h" value="#[attributes.headers]"/>
+        <set-variable variableName="body" value="#[output application/java --- if (attributes.method == 'PUT') payload.^raw as String else '']"/>
+        <set-variable variableName="bodyHash"
+                      value="#[lower(dw::core::Binaries::toHex(dw::Crypto::hashWith(vars.body as Binary {encoding: 'UTF-8'}, 'SHA-256')))]"/>
+        <set-variable variableName="respHeaders" value="#[{ 'x-amz-request-id': 'REQ1' }]"/>
+        <choice>
+            <when expression="#[vars.h.cloudflareaccessid != 'test-access-id' or vars.h.cloudflareaccesssecret != 'test-access-secret'
+                                or vars.h.cloudflarehostname != 's3.ap-southeast-2.amazonaws.com'
+                                or !(vars.h.authorization startsWith 'AWS4-HMAC-SHA256 Credential=ASIAFAKEKEY/')
+                                or !(vars.h.authorization contains '/ap-southeast-2/s3/aws4_request')
+                                or vars.h.'x-amz-security-token' != 'FAKE-SESSION-TOKEN'
+                                or !(vars.h.'x-amz-date' matches /\d{8}T\d{6}Z/)
+                                or vars.h.'x-amz-content-sha256' != vars.bodyHash]">
+                <set-variable variableName="status" value="#[400]"/>
+                <set-payload value='#["&lt;Error&gt;&lt;Code&gt;FakeCheckFailed&lt;/Code&gt;&lt;Message&gt;" ++ write(vars.h, "application/json", {indent: false}) ++ " bodyHash=" ++ vars.bodyHash ++ "&lt;/Message&gt;&lt;/Error&gt;"]'/>
+            </when>
+            <when expression="#[vars.objectKey startsWith '/bucket/sig/']">
+                <set-variable variableName="status" value="#[403]"/>
+                <set-payload value="&lt;Error&gt;&lt;Code&gt;SignatureDoesNotMatch&lt;/Code&gt;&lt;Message&gt;The request signature we calculated does not match&lt;/Message&gt;&lt;CanonicalRequest&gt;GET&#10;/bucket/sig/a.txt&#10;&#10;x-amz-security-token:FAKE-SESSION-TOKEN&#10;&lt;/CanonicalRequest&gt;&lt;/Error&gt;"/>
+            </when>
+            <when expression="#[attributes.method == 'PUT']">
+                <os:store key="#[vars.objectKey]" objectStore="fake-objects">
+                    <os:value>#[output application/java --- {
+                        content: vars.body,
+                        contentType: vars.h.'content-type',
+                        meta: vars.h filterObject ((v, k) -> (k as String) startsWith 'x-amz-meta-')
+                    }]</os:value>
+                </os:store>
+                <set-variable variableName="status" value="#[200]"/>
+                <set-variable variableName="respHeaders" value='#[vars.respHeaders ++ { etag: "\"s3etag\"" }]'/>
+                <set-payload value=""/>
+            </when>
+            <otherwise>
+                <os:contains key="#[vars.objectKey]" objectStore="fake-objects" target="exists"/>
+                <choice>
+                    <when expression="#[attributes.method == 'DELETE']">
+                        <try>
+                            <os:remove key="#[vars.objectKey]" objectStore="fake-objects"/>
+                            <error-handler>
+                                <on-error-continue type="OS:KEY_NOT_FOUND"/>
+                            </error-handler>
+                        </try>
+                        <set-variable variableName="status" value="#[204]"/>
+                        <set-payload value=""/>
+                    </when>
+                    <when expression="#[not vars.exists]">
+                        <set-variable variableName="status" value="#[404]"/>
+                        <set-payload value="&lt;Error&gt;&lt;Code&gt;NoSuchKey&lt;/Code&gt;&lt;Message&gt;The specified key does not exist.&lt;/Message&gt;&lt;/Error&gt;"/>
+                    </when>
+                    <otherwise>
+                        <os:retrieve key="#[vars.objectKey]" objectStore="fake-objects" target="obj"/>
+                        <set-variable variableName="status" value="#[200]"/>
+                        <set-variable variableName="respHeaders" value='#[vars.respHeaders ++ vars.obj.meta ++ {
+                            etag: "\"s3etag\"", "content-type": vars.obj.contentType }]'/>
+                        <set-payload value="#[vars.obj.content]"/>
+                    </otherwise>
+                </choice>
+            </otherwise>
+        </choice>
+    </flow>
+
+    <!-- Entra ID token + STS AssumeRoleWithWebIdentity: both POST through the module's identity config -->
+    <sub-flow name="mock-identity">
+        <munit-tools:mock-when processor="http:request">
+            <munit-tools:with-attributes>
+                <munit-tools:with-attribute attributeName="method" whereValue="POST"/>
+            </munit-tools:with-attributes>
+            <munit-tools:then-return>
+                <munit-tools:payload value='#[output text/plain --- "{\"access_token\":\"fake-jwt\",\"expires_in\":3599}
+                    &lt;AccessKeyId&gt;ASIAFAKEKEY&lt;/AccessKeyId&gt;&lt;SecretAccessKey&gt;fakeSecret&lt;/SecretAccessKey&gt;
+                    &lt;SessionToken&gt;FAKE-SESSION-TOKEN&lt;/SessionToken&gt;&lt;Expiration&gt;2099-01-01T00:00:00Z&lt;/Expiration&gt;"]'
+                                      mediaType="text/plain"/>
+                <munit-tools:attributes value="#[{ statusCode: 200, reasonPhrase: 'OK', headers: {} }]"/>
+            </munit-tools:then-return>
+        </munit-tools:mock-when>
+    </sub-flow>
+
+    <munit:test name="s3-put-get-head-delete-round-trip"
+                description="SigV4-signed requests reach the gateway with the STS session token and the body hash; results are mapped.">
+        <munit:enable-flow-sources>
+            <munit:enable-flow-source value="fake-s3"/>
+        </munit:enable-flow-sources>
+        <munit:behavior>
+            <flow-ref name="mock-identity"/>
+        </munit:behavior>
+        <munit:execution>
+            <set-payload value="hello s3" mimeType="text/plain"/>
+            <cf-storage:put-object config-ref="s3" key="dir/a b.txt" contentType="text/plain" userMetadata="#[{ source: 'munit' }]">
+                <cf-storage:content>#[payload]</cf-storage:content>
+            </cf-storage:put-object>
+            <set-variable variableName="put" value="#[payload]"/>
+            <cf-storage:get-object config-ref="s3" key="dir/a b.txt"/>
+            <set-variable variableName="got" value="#[payload.^raw as String]"/>
+            <cf-storage:head-object config-ref="s3" key="dir/a b.txt"/>
+            <set-variable variableName="head" value="#[payload]"/>
+            <cf-storage:delete-object config-ref="s3" key="dir/a b.txt"/>
+            <set-variable variableName="deleted" value="#[payload]"/>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-equals actual="#[vars.put.eTag]" expected='#["\"s3etag\""]'/>
+            <munit-tools:assert-equals actual="#[vars.put.requestId]" expected="REQ1"/>
+            <munit-tools:assert-equals actual="#[vars.put.storageType]" expected="S3"/>
+            <munit-tools:assert-equals actual="#[vars.got]" expected="hello s3"/>
+            <munit-tools:assert-equals actual="#[vars.head.userMetadata]" expected="#[{ source: 'munit' }]"/>
+            <munit-tools:assert-equals actual="#[vars.head.contentType]" expected="text/plain"/>
+            <munit-tools:assert-equals actual="#[vars.deleted]" expected="#[{ key: 'dir/a b.txt', deleted: true, storageType: 'S3' }]"/>
+        </munit:validation>
+    </munit:test>
+
+    <munit:test name="s3-get-missing-raises-not-found" expectedErrorType="CF-STORAGE:NOT_FOUND">
+        <munit:enable-flow-sources>
+            <munit:enable-flow-source value="fake-s3"/>
+        </munit:enable-flow-sources>
+        <munit:behavior>
+            <flow-ref name="mock-identity"/>
+        </munit:behavior>
+        <munit:execution>
+            <cf-storage:get-object config-ref="s3" key="missing.txt"/>
+        </munit:execution>
+    </munit:test>
+
+    <munit:test name="s3-head-missing-raises-not-found" expectedErrorType="CF-STORAGE:NOT_FOUND">
+        <munit:enable-flow-sources>
+            <munit:enable-flow-source value="fake-s3"/>
+        </munit:enable-flow-sources>
+        <munit:behavior>
+            <flow-ref name="mock-identity"/>
+        </munit:behavior>
+        <munit:execution>
+            <cf-storage:head-object config-ref="s3" key="missing.txt"/>
+        </munit:execution>
+    </munit:test>
+
+    <munit:test name="s3-signature-mismatch-reports-masked-canonical-request">
+        <munit:enable-flow-sources>
+            <munit:enable-flow-source value="fake-s3"/>
+        </munit:enable-flow-sources>
+        <munit:behavior>
+            <flow-ref name="mock-identity"/>
+        </munit:behavior>
+        <munit:execution>
+            <try>
+                <cf-storage:get-object config-ref="s3" key="sig/a.txt"/>
+                <error-handler>
+                    <on-error-continue type="CF-STORAGE:SIGNATURE_MISMATCH">
+                        <set-payload value="#[error.description]"/>
+                    </on-error-continue>
+                </error-handler>
+            </try>
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-that expression="#[payload]" is="#[MunitTools::containsString('SignatureDoesNotMatch')]"/>
+            <munit-tools:assert-that expression="#[payload]" is="#[MunitTools::containsString('x-amz-security-token:&lt;masked&gt;')]"/>
+            <munit-tools:assert-that expression="#[payload]" is="#[MunitTools::not(MunitTools::containsString('FAKE-SESSION-TOKEN'))]"/>
+        </munit:validation>
+    </munit:test>
+
+    <munit:test name="s3-bad-key-raises-bad-request" expectedErrorType="CF-STORAGE:BAD_REQUEST">
+        <munit:behavior>
+            <flow-ref name="mock-identity"/>
+        </munit:behavior>
+        <munit:execution>
+            <cf-storage:delete-object config-ref="s3" key="a//b.txt"/>
+        </munit:execution>
+    </munit:test>
+
+    <munit:test name="s3-invalid-metadata-raises-bad-request" expectedErrorType="CF-STORAGE:BAD_REQUEST">
+        <munit:behavior>
+            <flow-ref name="mock-identity"/>
+        </munit:behavior>
+        <munit:execution>
+            <set-payload value="x" mimeType="text/plain"/>
+            <cf-storage:put-object config-ref="s3" key="a.txt" contentType="text/plain" userMetadata="#[{ 'bad name': 'v' }]">
+                <cf-storage:content>#[payload]</cf-storage:content>
+            </cf-storage:put-object>
+        </munit:execution>
+    </munit:test>
+</mule>

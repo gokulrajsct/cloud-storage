@@ -1,0 +1,1093 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    Cloudflare Storage (XML SDK module)
+
+    One module, two backends behind a Cloudflare gateway, chosen with the "Storage type" field:
+      S3    Entra ID token -> AWS STS AssumeRoleWithWebIdentity -> temporary keys -> SigV4 (signer: extension)
+      ADLS  Entra ID token for https://storage.azure.com -> Authorization: Bearer (Azure Blob API, no signing)
+    The four public operations (put / get / head / delete object) behave the same for both and return the
+    same output shape and the same CF-STORAGE:* errors.
+
+    XML SDK conventions used below:
+      * core elements need the mule: prefix (mule:choice, mule:set-variable, ...)
+      * config fields and operation parameters are read as vars.<name>
+      * private helper operations are called through the module's own namespace: tns:<operation>
+-->
+<module name="Cloudflare Storage"
+        prefix="cf-storage"
+        namespace="http://www.mulesoft.org/schema/mule/cf-storage"
+        doc:description="S3 or ADLS Gen2 reached through a Cloudflare gateway, authenticated with Entra ID (no stored storage keys)."
+        xmlns="http://www.mulesoft.org/schema/mule/module"
+        xmlns:mule="http://www.mulesoft.org/schema/mule/core"
+        xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+        xmlns:tns="http://www.mulesoft.org/schema/mule/cf-storage"
+        xmlns:http="http://www.mulesoft.org/schema/mule/http"
+        xmlns:os="http://www.mulesoft.org/schema/mule/os"
+        xmlns:signer="http://www.mulesoft.org/schema/mule/signer"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="
+           http://www.mulesoft.org/schema/mule/module http://www.mulesoft.org/schema/mule/module/current/mule-module.xsd
+           http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+           http://www.mulesoft.org/schema/mule/cf-storage http://www.mulesoft.org/schema/mule/cf-storage/current/mule-cf-storage.xsd
+           http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+           http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+           http://www.mulesoft.org/schema/mule/signer http://www.mulesoft.org/schema/mule/signer/current/mule-signer.xsd">
+
+    <!-- ======================================================================================= config fields -->
+
+    <property name="storageType" type="string" use="OPTIONAL" defaultValue="S3" displayName="Storage type"
+              summary="S3 or ADLS. Decides which of the S3 / ADLS fields below are required."/>
+
+    <!-- Cloudflare gateway (both) -->
+    <property name="gatewayHost" type="string" displayName="Gateway host"
+              summary="Cloudflare host Mule connects to, without scheme or port." example="storage-proxy.example.com"/>
+    <property name="gatewayPort" type="string" use="OPTIONAL" defaultValue="443" displayName="Gateway port"/>
+    <property name="gatewayProtocol" type="string" use="OPTIONAL" defaultValue="HTTPS" displayName="Gateway protocol"
+              summary="HTTPS, or HTTP for local mocks only."/>
+    <property name="hostNameHeader" type="string" use="OPTIONAL" defaultValue="cloudFlareHostName" displayName="Host name header"
+              summary="Header telling Cloudflare which storage host to forward to (the S3 signing host, or account.blob.core.windows.net). Empty: not sent."/>
+    <property name="accessIdHeader" type="string" use="OPTIONAL" defaultValue="cloudFlareAccessId" displayName="Access id header"/>
+    <property name="accessId" type="string" use="OPTIONAL" displayName="Access id"
+              summary="Cloudflare access id. Use a secure property." example="${secure::cloudflare.accessId}"/>
+    <property name="accessSecretHeader" type="string" use="OPTIONAL" defaultValue="cloudFlareAccessSecret" displayName="Access secret header"/>
+    <property name="accessSecret" type="string" use="OPTIONAL" password="true" displayName="Access secret"
+              summary="Cloudflare access secret. Use a secure property." example="${secure::cloudflare.accessSecret}"/>
+
+    <!-- Entra ID (both) -->
+    <property name="tenantId" type="string" displayName="Tenant ID" summary="Directory (tenant) ID."/>
+    <property name="clientId" type="string" displayName="Client ID" summary="Application (client) ID of the app registration."/>
+    <property name="authMode" type="string" use="OPTIONAL" defaultValue="CLIENT_SECRET" displayName="Authentication"
+              summary="CLIENT_SECRET or CERTIFICATE (signed client assertion; no secret stored)."/>
+    <property name="clientSecret" type="string" use="OPTIONAL" password="true" displayName="Client secret"
+              summary="Required when Authentication is CLIENT_SECRET." example="${secure::entra.clientSecret}"/>
+    <property name="certificateKeystore" type="string" use="OPTIONAL" displayName="Certificate keystore"
+              summary="Required when Authentication is CERTIFICATE: PKCS12 file path or classpath resource." example="certs/mule-entra.p12"/>
+    <property name="certificateKeystorePassword" type="string" use="OPTIONAL" password="true" displayName="Certificate keystore password"/>
+    <property name="certificateAlias" type="string" use="OPTIONAL" displayName="Certificate alias"
+              summary="Keystore entry; empty uses the first private key."/>
+    <property name="authorityHost" type="string" use="OPTIONAL" defaultValue="https://login.microsoftonline.com" displayName="Authority host"/>
+
+    <!-- S3 only -->
+    <property name="region" type="string" use="OPTIONAL" displayName="S3: bucket region"
+              summary="Required for S3. AWS region of the bucket." example="ap-southeast-2"/>
+    <property name="signingHost" type="string" use="OPTIONAL" displayName="S3: signing host"
+              summary="Required for S3. Host S3 receives the request on: bucket.s3.region.amazonaws.com, or s3.region.amazonaws.com plus Path prefix /bucket."
+              example="my-bucket.s3.ap-southeast-2.amazonaws.com"/>
+    <property name="pathPrefix" type="string" use="OPTIONAL" defaultValue="" displayName="S3: path prefix"
+              summary="Empty for virtual-hosted style; /bucket for path style." example="/my-bucket"/>
+    <property name="signPayload" type="boolean" use="OPTIONAL" defaultValue="true" displayName="S3: sign payload"
+              summary="true signs the body's SHA-256. false sends UNSIGNED-PAYLOAD (still protected by HTTPS)."/>
+    <property name="scope" type="string" use="OPTIONAL" displayName="S3: token scope"
+              summary="Entra token scope for AWS. Empty means api://Client ID/.default."/>
+    <property name="roleArn" type="string" use="OPTIONAL" displayName="S3: role ARN"
+              summary="Required for S3. IAM role trusting the Entra ID OIDC provider." example="arn:aws:iam::123456789012:role/mule-s3-oidc-role"/>
+    <property name="stsRegion" type="string" use="OPTIONAL" displayName="S3: STS region"
+              summary="Required for S3. Region of the STS endpoint, usually the bucket's." example="ap-southeast-2"/>
+    <property name="sessionDurationSeconds" type="string" use="OPTIONAL" defaultValue="3600" displayName="S3: session duration (seconds)"
+              summary="900 up to the role's maximum session duration."/>
+    <property name="sessionNamePrefix" type="string" use="OPTIONAL" defaultValue="mule" displayName="S3: session name prefix"
+              summary="Shown in CloudTrail with a random suffix. Letters, digits and + = , . @ - _" example="orders-api"/>
+
+    <!-- ADLS only -->
+    <property name="adlsAccount" type="string" use="OPTIONAL" displayName="ADLS: storage account"
+              summary="Required for ADLS. Storage account name (the part before .blob.core.windows.net)." example="mystorageacct"/>
+    <property name="adlsContainer" type="string" use="OPTIONAL" displayName="ADLS: container"
+              summary="Required for ADLS. Container (file system) the keys live in." example="invoices"/>
+    <property name="adlsEndpointSuffix" type="string" use="OPTIONAL" defaultValue="blob.core.windows.net" displayName="ADLS: endpoint suffix"
+              summary="Change only for sovereign clouds."/>
+    <property name="adlsApiVersion" type="string" use="OPTIONAL" defaultValue="2021-08-06" displayName="ADLS: API version"
+              summary="Azure Storage REST version sent as x-ms-version."/>
+    <property name="adlsScope" type="string" use="OPTIONAL" defaultValue="https://storage.azure.com/.default" displayName="ADLS: token scope"/>
+
+    <!-- Advanced (both) -->
+    <property name="responseTimeoutMillis" type="string" use="OPTIONAL" defaultValue="60000" displayName="Response timeout (ms)"/>
+    <property name="debugSigning" type="boolean" use="OPTIONAL" defaultValue="false" displayName="Debug signing (S3)"
+              summary="Logs the S3 canonical request (token masked) to compare with a SignatureDoesNotMatch error. Keep off in production."/>
+
+    <!-- ======================================================================================= global elements -->
+
+    <!-- Cloudflare. xmlns:connection marks it as what Studio's "Test connection" checks. -->
+    <http:request-config name="cf-storage-gateway" responseTimeout="#[vars.responseTimeoutMillis]" xmlns:connection="true">
+        <http:request-connection protocol="#[vars.gatewayProtocol]" host="#[vars.gatewayHost]" port="#[vars.gatewayPort]"/>
+    </http:request-config>
+
+    <!-- Entra ID and STS: called with absolute URLs, so no host here -->
+    <http:request-config name="cf-storage-identity" responseTimeout="30000"/>
+
+    <!-- Cached credentials: "s3-credentials" (STS keys) and "adls-token" (Entra token for Azure Storage) -->
+    <os:object-store name="cf-storage-cache" persistent="false" maxEntries="2"
+                     entryTtl="#[vars.sessionDurationSeconds]" entryTtlUnit="SECONDS"/>
+
+    <!-- ======================================================================================= public operations -->
+
+    <operation name="put-object" displayName="Put object"
+               summary="Uploads the content, replacing any object with the same key.">
+        <parameters>
+            <parameter name="key" type="string" displayName="Key"
+                       summary="Object key: S3 key without the bucket, or blob path without the container." example="invoices/2026/invoice-1001.pdf"/>
+            <parameter name="content" type="binary" role="CONTENT" displayName="Content"
+                       summary="The bytes to upload. Defaults to the payload."/>
+            <parameter name="contentType" type="string" use="OPTIONAL" defaultValue="application/octet-stream"
+                       displayName="Content type" example="application/pdf"/>
+            <parameter name="userMetadata" type="any" use="OPTIONAL" displayName="User metadata"
+                       summary="Object of name/value pairs (x-amz-meta-* / x-ms-meta-*). Names that work on both: letters, digits and _ ; values: printable ASCII."/>
+        </parameters>
+        <body>
+            <tns:check-config/>
+            <mule:choice>
+                <mule:when expression="#[upper(vars.storageType default 'S3') == 'ADLS']">
+                    <tns:adls-put key="#[vars.key]" content="#[vars.content]" contentType="#[vars.contentType]"
+                                  userMetadata="#[vars.userMetadata default {}]"/>
+                </mule:when>
+                <mule:otherwise>
+                    <tns:s3-put key="#[vars.key]" content="#[vars.content]" contentType="#[vars.contentType]"
+                                userMetadata="#[vars.userMetadata default {}]"/>
+                </mule:otherwise>
+            </mule:choice>
+        </body>
+        <output type="any"/>
+        <errors>
+            <error type="CONFIGURATION"/>
+            <error type="BAD_REQUEST"/>
+            <error type="CONNECTIVITY"/>
+            <error type="AUTHENTICATION"/>
+            <error type="GATEWAY_REJECTED"/>
+            <error type="INVALID_CREDENTIALS"/>
+            <error type="SIGNATURE_MISMATCH"/>
+            <error type="ACCESS_DENIED"/>
+            <error type="NOT_FOUND"/>
+            <error type="BAD_DIGEST"/>
+            <error type="SERVER_ERROR"/>
+        </errors>
+    </operation>
+
+    <operation name="get-object" displayName="Get object"
+               summary="Downloads an object. The payload is its content; attributes are the storage response's (attributes.headers.etag, ...).">
+        <parameters>
+            <parameter name="key" type="string" displayName="Key" summary="Object key / blob path." example="invoices/2026/invoice-1001.pdf"/>
+        </parameters>
+        <body>
+            <tns:check-config/>
+            <mule:choice>
+                <mule:when expression="#[upper(vars.storageType default 'S3') == 'ADLS']">
+                    <tns:adls-get key="#[vars.key]"/>
+                </mule:when>
+                <mule:otherwise>
+                    <tns:s3-get key="#[vars.key]"/>
+                </mule:otherwise>
+            </mule:choice>
+        </body>
+        <output type="binary"/>
+        <output-attributes type="any"/>
+        <errors>
+            <error type="CONFIGURATION"/>
+            <error type="BAD_REQUEST"/>
+            <error type="CONNECTIVITY"/>
+            <error type="AUTHENTICATION"/>
+            <error type="GATEWAY_REJECTED"/>
+            <error type="INVALID_CREDENTIALS"/>
+            <error type="SIGNATURE_MISMATCH"/>
+            <error type="ACCESS_DENIED"/>
+            <error type="NOT_FOUND"/>
+            <error type="BAD_DIGEST"/>
+            <error type="SERVER_ERROR"/>
+        </errors>
+    </operation>
+
+    <operation name="head-object" displayName="Head object"
+               summary="Returns an object's details without downloading it. Raises CF-STORAGE:NOT_FOUND when it does not exist.">
+        <parameters>
+            <parameter name="key" type="string" displayName="Key" summary="Object key / blob path." example="invoices/2026/invoice-1001.pdf"/>
+        </parameters>
+        <body>
+            <tns:check-config/>
+            <mule:choice>
+                <mule:when expression="#[upper(vars.storageType default 'S3') == 'ADLS']">
+                    <tns:adls-head key="#[vars.key]"/>
+                </mule:when>
+                <mule:otherwise>
+                    <tns:s3-head key="#[vars.key]"/>
+                </mule:otherwise>
+            </mule:choice>
+        </body>
+        <output type="any"/>
+        <errors>
+            <error type="CONFIGURATION"/>
+            <error type="BAD_REQUEST"/>
+            <error type="CONNECTIVITY"/>
+            <error type="AUTHENTICATION"/>
+            <error type="GATEWAY_REJECTED"/>
+            <error type="INVALID_CREDENTIALS"/>
+            <error type="SIGNATURE_MISMATCH"/>
+            <error type="ACCESS_DENIED"/>
+            <error type="NOT_FOUND"/>
+            <error type="BAD_DIGEST"/>
+            <error type="SERVER_ERROR"/>
+        </errors>
+    </operation>
+
+    <operation name="delete-object" displayName="Delete object"
+               summary="Deletes an object. Succeeds even if the key does not exist (same on S3 and ADLS).">
+        <parameters>
+            <parameter name="key" type="string" displayName="Key" summary="Object key / blob path." example="invoices/2026/invoice-1001.pdf"/>
+        </parameters>
+        <body>
+            <tns:check-config/>
+            <mule:choice>
+                <mule:when expression="#[upper(vars.storageType default 'S3') == 'ADLS']">
+                    <tns:adls-delete key="#[vars.key]"/>
+                </mule:when>
+                <mule:otherwise>
+                    <tns:s3-delete key="#[vars.key]"/>
+                </mule:otherwise>
+            </mule:choice>
+        </body>
+        <output type="any"/>
+        <errors>
+            <error type="CONFIGURATION"/>
+            <error type="BAD_REQUEST"/>
+            <error type="CONNECTIVITY"/>
+            <error type="AUTHENTICATION"/>
+            <error type="GATEWAY_REJECTED"/>
+            <error type="INVALID_CREDENTIALS"/>
+            <error type="SIGNATURE_MISMATCH"/>
+            <error type="ACCESS_DENIED"/>
+            <error type="NOT_FOUND"/>
+            <error type="BAD_DIGEST"/>
+            <error type="SERVER_ERROR"/>
+        </errors>
+    </operation>
+
+    <!-- ======================================================================================= shared private operations -->
+
+    <!-- Fails fast, with every missing field named, when the config does not fit the chosen storage type. -->
+    <operation name="check-config" visibility="PRIVATE">
+        <body>
+            <mule:set-variable variableName="problems" value="#[do {
+                var t = upper(vars.storageType default 'S3')
+                var auth = if (upper(vars.authMode default 'CLIENT_SECRET') == 'CERTIFICATE')
+                               { certificateKeystore: vars.certificateKeystore, certificateKeystorePassword: vars.certificateKeystorePassword }
+                           else { clientSecret: vars.clientSecret }
+                var specific = if (t == 'ADLS') { adlsAccount: vars.adlsAccount, adlsContainer: vars.adlsContainer }
+                               else { region: vars.region, signingHost: vars.signingHost, roleArn: vars.roleArn, stsRegion: vars.stsRegion }
+                var missing = ({ gatewayHost: vars.gatewayHost, tenantId: vars.tenantId, clientId: vars.clientId } ++ auth ++ specific)
+                              filterObject ((v) -> isEmpty(v)) pluck ($$ as String)
+                ---
+                if (t != 'S3' and t != 'ADLS') ['Storage type must be S3 or ADLS, got ' ++ (vars.storageType default '')]
+                else if (isEmpty(missing)) []
+                else ['Missing for storage type ' ++ t ++ ': ' ++ (missing joinBy ', ')]
+            }]"/>
+            <mule:choice>
+                <mule:when expression="#[!isEmpty(vars.problems)]">
+                    <mule:raise-error type="CF-STORAGE:CONFIGURATION" description="#['Cloudflare Storage config: ' ++ (vars.problems joinBy '; ')]"/>
+                </mule:when>
+            </mule:choice>
+        </body>
+        <output type="any"/>
+        <errors>
+            <error type="CONFIGURATION"/>
+        </errors>
+    </operation>
+
+    <!-- Entra ID client-credentials token for a scope (client secret or certificate). Output { token, expiresAt }. -->
+    <operation name="entra-token" visibility="PRIVATE">
+        <parameters>
+            <parameter name="tokenScope" type="string"/>
+        </parameters>
+        <body>
+            <mule:set-variable variableName="tokenEndpoint"
+                               value="#[(if (isEmpty(vars.authorityHost)) 'https://login.microsoftonline.com' else vars.authorityHost) ++ '/' ++ vars.tenantId ++ '/oauth2/v2.0/token']"/>
+            <mule:choice>
+                <mule:when expression="#[upper(vars.authMode default 'CLIENT_SECRET') == 'CERTIFICATE']">
+                    <mule:try>
+                        <signer:create-entra-client-assertion tokenEndpoint="#[vars.tokenEndpoint]" clientId="#[vars.clientId]"
+                                                              keystore="#[vars.certificateKeystore]"
+                                                              keystorePassword="#[vars.certificateKeystorePassword]"
+                                                              alias="#[vars.certificateAlias]" target="assertion"/>
+                        <mule:error-handler>
+                            <mule:on-error-propagate type="SIGNER:CERTIFICATE, SIGNER:INVALID_INPUT">
+                                <mule:raise-error type="CF-STORAGE:AUTHENTICATION" description="#[error.description]"/>
+                            </mule:on-error-propagate>
+                        </mule:error-handler>
+                    </mule:try>
+                    <mule:set-variable variableName="clientAuth"
+                                       value="#[{ client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer', client_assertion: vars.assertion }]"/>
+                </mule:when>
+                <mule:otherwise>
+                    <mule:set-variable variableName="clientAuth" value="#[{ client_secret: vars.clientSecret default '' }]"/>
+                </mule:otherwise>
+            </mule:choice>
+            <mule:try>
+                <http:request method="POST" config-ref="cf-storage-identity" url="#[vars.tokenEndpoint]">
+                    <http:body><![CDATA[#[output application/x-www-form-urlencoded --- {
+                        grant_type: 'client_credentials',
+                        client_id: vars.clientId,
+                        scope: vars.tokenScope
+                    } ++ vars.clientAuth]]]></http:body>
+                    <http:response-validator>
+                        <http:success-status-code-validator values="100..599"/>
+                    </http:response-validator>
+                </http:request>
+                <mule:error-handler>
+                    <mule:on-error-propagate type="HTTP:CONNECTIVITY, HTTP:TIMEOUT">
+                        <mule:raise-error type="CF-STORAGE:CONNECTIVITY" description="#['Could not reach Entra ID: ' ++ error.description]"/>
+                    </mule:on-error-propagate>
+                </mule:error-handler>
+            </mule:try>
+            <mule:set-variable variableName="entraBody"
+                               value="#[do { var r = dw::Runtime::try(() -&gt; payload.^raw as String) --- if (r.success) r.result else '' }]"/>
+            <mule:set-variable variableName="accessToken"
+                               value="#[(vars.entraBody scan /&quot;access_token&quot;\s*:\s*&quot;([^&quot;]+)&quot;/)[0][1] default null]"/>
+            <mule:choice>
+                <mule:when expression="#[attributes.statusCode != 200 or vars.accessToken == null]">
+                    <mule:raise-error type="CF-STORAGE:AUTHENTICATION"
+                                      description="#['Entra ID token request for ' ++ vars.tokenScope ++ ' failed (HTTP ' ++ (attributes.statusCode as String) ++ '): ' ++ ((vars.entraBody scan /&quot;error_description&quot;\s*:\s*&quot;([^&quot;\\]+)/)[0][1] default vars.entraBody)]"/>
+                </mule:when>
+            </mule:choice>
+            <mule:set-payload value="#[output application/java --- {
+                token: vars.accessToken,
+                expiresAt: (now() + (('PT' ++ ((vars.entraBody scan /&quot;expires_in&quot;\s*:\s*&quot;?(\d+)/)[0][1] default '3600') ++ 'S') as Period)) as String
+            }]"/>
+        </body>
+        <output type="any"/>
+        <errors>
+            <error type="AUTHENTICATION"/>
+            <error type="CONNECTIVITY"/>
+        </errors>
+    </operation>
+
+    <!-- Turns a non-2xx S3 / ADLS / Cloudflare response into the matching CF-STORAGE error. Always raises. -->
+    <operation name="raise-storage-error" visibility="PRIVATE">
+        <parameters>
+            <parameter name="backend" type="string"/>
+            <parameter name="method" type="string"/>
+            <parameter name="key" type="string"/>
+            <parameter name="statusCode" type="number"/>
+            <parameter name="responseBody" type="string" use="OPTIONAL" defaultValue=""/>
+            <parameter name="errorCode" type="string" use="OPTIONAL" defaultValue=""/>
+            <parameter name="requestId" type="string" use="OPTIONAL" defaultValue=""/>
+        </parameters>
+        <body>
+            <mule:set-variable variableName="code"
+                               value="#[output application/java --- if (!isEmpty(vars.errorCode)) vars.errorCode else (((vars.responseBody default '') scan /&lt;Code&gt;([^&lt;]+)&lt;\/Code&gt;/)[0][1] default null)]"/>
+            <mule:set-variable variableName="kind" value="#[do {
+                var code = vars.code
+                var status = vars.statusCode as Number
+                var fromStorage = code != null or !isEmpty(vars.requestId)
+                ---
+                if (!fromStorage and (status == 401 or status == 403)) 'GATEWAY_REJECTED'
+                else if (['NoSuchKey', 'NoSuchBucket', 'NoSuchVersion', 'BlobNotFound', 'ContainerNotFound',
+                          'ResourceNotFound', 'PathNotFound', 'FilesystemNotFound'] contains code) 'NOT_FOUND'
+                else if (code == 'SignatureDoesNotMatch') 'SIGNATURE_MISMATCH'
+                else if (['AccessDenied', 'AllAccessDisabled', 'AuthorizationPermissionMismatch', 'AuthorizationFailure',
+                          'InsufficientAccountPermissions', 'AuthorizationSourceIPMismatch', 'AuthorizationProtocolMismatch'] contains code) 'ACCESS_DENIED'
+                else if (['InvalidAccessKeyId', 'ExpiredToken', 'InvalidToken', 'TokenRefreshRequired',
+                          'InvalidAuthenticationInfo', 'AuthenticationFailed'] contains code) 'INVALID_CREDENTIALS'
+                else if (['XAmzContentSHA256Mismatch', 'BadDigest', 'Md5Mismatch'] contains code) 'BAD_DIGEST'
+                else if (code == null and status == 404) 'NOT_FOUND'
+                else if (code == null and status == 403) 'ACCESS_DENIED'
+                else if (status &gt;= 500) 'SERVER_ERROR'
+                else 'BAD_REQUEST'
+            }]"/>
+            <mule:set-variable variableName="message" value="#[output application/java --- do {
+                var storageMessage = ((vars.responseBody default '') scan /&lt;Message&gt;([^&lt;]+)&lt;\/Message&gt;/)[0][1] default null
+                var canonical = ((vars.responseBody default '') scan /(?s)&lt;CanonicalRequest&gt;(.*?)&lt;\/CanonicalRequest&gt;/)[0][1] default null
+                ---
+                if (vars.kind == 'GATEWAY_REJECTED')
+                    'The gateway rejected ' ++ vars.backend ++ ' ' ++ vars.method ++ ' ' ++ vars.key ++ ' (HTTP ' ++ (vars.statusCode as String) ++ ') before it reached storage. Check the Cloudflare access id/secret and header names.'
+                else
+                    vars.backend ++ ' ' ++ vars.method ++ ' ' ++ vars.key ++ ' failed (HTTP ' ++ (vars.statusCode as String)
+                    ++ (if (vars.code != null) ' ' ++ vars.code else '') ++ ')'
+                    ++ (if (storageMessage != null) ': ' ++ (storageMessage splitBy '\n')[0] else '')
+                    ++ (if (!isEmpty(vars.requestId)) ' [request id ' ++ vars.requestId ++ ']' else '')
+                    ++ (if (canonical != null) '\nS3 canonical request:\n' ++ (canonical replace /(?m)^x-amz-security-token:.*$/ with 'x-amz-security-token:&lt;masked&gt;') else '')
+            }]"/>
+            <mule:choice>
+                <mule:when expression="#[vars.kind == 'INVALID_CREDENTIALS']">
+                    <!-- drop the cached credentials so the next call fetches new ones -->
+                    <mule:try>
+                        <os:remove key="#[if (vars.backend == 'ADLS') 'adls-token' else 's3-credentials']" objectStore="cf-storage-cache"/>
+                        <mule:error-handler>
+                            <mule:on-error-continue type="OS:KEY_NOT_FOUND"/>
+                        </mule:error-handler>
+                    </mule:try>
+                    <mule:raise-error type="CF-STORAGE:INVALID_CREDENTIALS" description="#[vars.message]"/>
+                </mule:when>
+                <mule:when expression="#[vars.kind == 'GATEWAY_REJECTED']">
+                    <mule:raise-error type="CF-STORAGE:GATEWAY_REJECTED" description="#[vars.message]"/>
+                </mule:when>
+                <mule:when expression="#[vars.kind == 'NOT_FOUND']">
+                    <mule:raise-error type="CF-STORAGE:NOT_FOUND" description="#[vars.message]"/>
+                </mule:when>
+                <mule:when expression="#[vars.kind == 'SIGNATURE_MISMATCH']">
+                    <mule:raise-error type="CF-STORAGE:SIGNATURE_MISMATCH" description="#[vars.message]"/>
+                </mule:when>
+                <mule:when expression="#[vars.kind == 'ACCESS_DENIED']">
+                    <mule:raise-error type="CF-STORAGE:ACCESS_DENIED" description="#[vars.message]"/>
+                </mule:when>
+                <mule:when expression="#[vars.kind == 'BAD_DIGEST']">
+                    <mule:raise-error type="CF-STORAGE:BAD_DIGEST" description="#[vars.message]"/>
+                </mule:when>
+                <mule:when expression="#[vars.kind == 'SERVER_ERROR']">
+                    <mule:raise-error type="CF-STORAGE:SERVER_ERROR" description="#[vars.message]"/>
+                </mule:when>
+                <mule:otherwise>
+                    <mule:raise-error type="CF-STORAGE:BAD_REQUEST" description="#[vars.message]"/>
+                </mule:otherwise>
+            </mule:choice>
+        </body>
+        <output type="any"/>
+        <errors>
+            <error type="GATEWAY_REJECTED"/>
+            <error type="INVALID_CREDENTIALS"/>
+            <error type="NOT_FOUND"/>
+            <error type="SIGNATURE_MISMATCH"/>
+            <error type="ACCESS_DENIED"/>
+            <error type="BAD_DIGEST"/>
+            <error type="SERVER_ERROR"/>
+            <error type="BAD_REQUEST"/>
+        </errors>
+    </operation>
+
+    <!-- ======================================================================================= S3 private operations -->
+
+    <!-- Cached STS credentials { accessKeyId, secretAccessKey, sessionToken, expiresAt }; refreshed 5 min before expiry. -->
+    <operation name="s3-credentials" visibility="PRIVATE">
+        <body>
+            <os:retrieve key="s3-credentials" objectStore="cf-storage-cache" target="cached">
+                <os:default-value>#[{}]</os:default-value>
+            </os:retrieve>
+            <mule:choice>
+                <mule:when expression="#[!isEmpty(vars.cached) and ((vars.cached.expiresAt as DateTime) &gt; (now() + |PT5M|))]">
+                    <mule:set-payload value="#[vars.cached]"/>
+                </mule:when>
+                <mule:otherwise>
+                    <tns:fetch-s3-credentials/>
+                    <os:store key="s3-credentials" objectStore="cf-storage-cache"/>
+                </mule:otherwise>
+            </mule:choice>
+        </body>
+        <output type="any"/>
+        <errors>
+            <error type="AUTHENTICATION"/>
+            <error type="CONNECTIVITY"/>
+        </errors>
+    </operation>
+
+    <!-- Entra ID token (AWS audience), then AWS STS AssumeRoleWithWebIdentity. -->
+    <operation name="fetch-s3-credentials" visibility="PRIVATE">
+        <body>
+            <tns:entra-token tokenScope="#[if (isEmpty(vars.scope)) 'api://' ++ vars.clientId ++ '/.default' else vars.scope]"/>
+            <mule:set-variable variableName="webIdentityToken" value="#[payload.token]"/>
+            <mule:try>
+                <http:request method="POST" config-ref="cf-storage-identity" url="#['https://sts.' ++ vars.stsRegion ++ '.amazonaws.com/']">
+                    <http:body><![CDATA[#[output application/x-www-form-urlencoded --- {
+                        Action: 'AssumeRoleWithWebIdentity',
+                        Version: '2011-06-15',
+                        RoleArn: vars.roleArn,
+                        RoleSessionName: (vars.sessionNamePrefix default 'mule') ++ '-' ++ (uuid() replace '-' with '')[0 to 11],
+                        WebIdentityToken: vars.webIdentityToken,
+                        DurationSeconds: vars.sessionDurationSeconds as String
+                    }]]]></http:body>
+                    <http:response-validator>
+                        <http:success-status-code-validator values="100..599"/>
+                    </http:response-validator>
+                </http:request>
+                <mule:error-handler>
+                    <mule:on-error-propagate type="HTTP:CONNECTIVITY, HTTP:TIMEOUT">
+                        <mule:raise-error type="CF-STORAGE:CONNECTIVITY" description="#['Could not reach AWS STS: ' ++ error.description]"/>
+                    </mule:on-error-propagate>
+                </mule:error-handler>
+            </mule:try>
+            <!-- read the XML as text: the field names are unique in the response -->
+            <mule:set-variable variableName="stsBody"
+                               value="#[do { var r = dw::Runtime::try(() -&gt; payload.^raw as String) --- if (r.success) r.result else '' }]"/>
+            <mule:choice>
+                <mule:when expression="#[attributes.statusCode != 200]">
+                    <mule:raise-error type="CF-STORAGE:AUTHENTICATION"
+                                      description="#['AWS STS AssumeRoleWithWebIdentity failed (HTTP ' ++ (attributes.statusCode as String) ++ ' ' ++ ((vars.stsBody scan /&lt;Code&gt;([^&lt;]+)&lt;\/Code&gt;/)[0][1] default '') ++ '): ' ++ ((vars.stsBody scan /&lt;Message&gt;([^&lt;]+)&lt;\/Message&gt;/)[0][1] default '')]"/>
+                </mule:when>
+            </mule:choice>
+            <mule:set-payload value="#[output application/java --- {
+                accessKeyId:     (vars.stsBody scan /&lt;AccessKeyId&gt;([^&lt;]+)&lt;\/AccessKeyId&gt;/)[0][1],
+                secretAccessKey: (vars.stsBody scan /&lt;SecretAccessKey&gt;([^&lt;]+)&lt;\/SecretAccessKey&gt;/)[0][1],
+                sessionToken:    (vars.stsBody scan /&lt;SessionToken&gt;([^&lt;]+)&lt;\/SessionToken&gt;/)[0][1],
+                expiresAt:       (vars.stsBody scan /&lt;Expiration&gt;([^&lt;]+)&lt;\/Expiration&gt;/)[0][1]
+            }]"/>
+            <mule:logger level="INFO" category="cf-storage.credentials"
+                         message="#['Obtained temporary AWS credentials for ' ++ vars.roleArn ++ ', valid until ' ++ (payload.expiresAt default '?')]"/>
+        </body>
+        <output type="any"/>
+        <errors>
+            <error type="AUTHENTICATION"/>
+            <error type="CONNECTIVITY"/>
+        </errors>
+    </operation>
+
+    <!-- Logs what was signed when Debug signing is on. -->
+    <operation name="log-signing" visibility="PRIVATE">
+        <parameters>
+            <parameter name="method" type="string"/>
+            <parameter name="key" type="string"/>
+            <parameter name="canonicalRequest" type="string"/>
+        </parameters>
+        <body>
+            <mule:choice>
+                <mule:when expression="#[vars.debugSigning default false]">
+                    <mule:logger level="INFO" category="cf-storage.signing"
+                                 message="#['SigV4 ' ++ vars.method ++ ' ' ++ vars.key ++ ' via ' ++ vars.gatewayHost ++ ' (signed for ' ++ vars.signingHost ++ '):\n' ++ vars.canonicalRequest]"/>
+                </mule:when>
+            </mule:choice>
+        </body>
+        <output type="any"/>
+    </operation>
+
+    <!-- Signs a body-less S3 request (GET / HEAD / DELETE). Output: the SignedS3Request (path, headers, ...). -->
+    <operation name="s3-sign" visibility="PRIVATE">
+        <parameters>
+            <parameter name="method" type="string"/>
+            <parameter name="key" type="string"/>
+        </parameters>
+        <body>
+            <tns:s3-credentials/>
+            <mule:set-variable variableName="creds" value="#[payload]"/>
+            <mule:try>
+                <signer:sign-s3-request method="#[vars.method]" signingHost="#[vars.signingHost]" region="#[vars.region]"
+                                        key="#[vars.key]" pathPrefix="#[vars.pathPrefix]"
+                                        accessKeyId="#[vars.creds.accessKeyId]" secretAccessKey="#[vars.creds.secretAccessKey]"
+                                        sessionToken="#[vars.creds.sessionToken]" target="signed">
+                    <!-- not read for GET/HEAD/DELETE; passed explicitly so the payload is never converted -->
+                    <signer:body>#['']</signer:body>
+                </signer:sign-s3-request>
+                <mule:error-handler>
+                    <mule:on-error-propagate type="SIGNER:INVALID_INPUT, SIGNER:BODY_UNREADABLE">
+                        <mule:raise-error type="CF-STORAGE:BAD_REQUEST" description="#[error.description]"/>
+                    </mule:on-error-propagate>
+                </mule:error-handler>
+            </mule:try>
+            <tns:log-signing method="#[vars.method]" key="#[vars.key]" canonicalRequest="#[vars.signed.canonicalRequest]"/>
+            <mule:set-payload value="#[vars.signed]"/>
+        </body>
+        <output type="any"/>
+        <errors>
+            <error type="BAD_REQUEST"/>
+            <error type="AUTHENTICATION"/>
+            <error type="CONNECTIVITY"/>
+        </errors>
+    </operation>
+
+    <operation name="s3-put" visibility="PRIVATE">
+        <parameters>
+            <parameter name="key" type="string"/>
+            <parameter name="content" type="binary"/>
+            <parameter name="contentType" type="string"/>
+            <parameter name="userMetadata" type="any" use="OPTIONAL"/>
+        </parameters>
+        <body>
+            <tns:s3-credentials/>
+            <mule:set-variable variableName="creds" value="#[payload]"/>
+            <mule:try>
+                <signer:sign-s3-request method="PUT" signingHost="#[vars.signingHost]" region="#[vars.region]"
+                                        key="#[vars.key]" pathPrefix="#[vars.pathPrefix]" signPayload="#[vars.signPayload]"
+                                        accessKeyId="#[vars.creds.accessKeyId]" secretAccessKey="#[vars.creds.secretAccessKey]"
+                                        sessionToken="#[vars.creds.sessionToken]" userMetadata="#[vars.userMetadata default {}]"
+                                        target="signed">
+                    <signer:body>#[vars.content]</signer:body>
+                </signer:sign-s3-request>
+                <mule:error-handler>
+                    <mule:on-error-propagate type="SIGNER:INVALID_INPUT, SIGNER:BODY_UNREADABLE">
+                        <mule:raise-error type="CF-STORAGE:BAD_REQUEST" description="#[error.description]"/>
+                    </mule:on-error-propagate>
+                </mule:error-handler>
+            </mule:try>
+            <tns:log-signing method="PUT" key="#[vars.key]" canonicalRequest="#[vars.signed.canonicalRequest]"/>
+            <mule:try>
+                <!-- NEVER: S3 needs a Content-Length, not chunked transfer encoding -->
+                <http:request method="PUT" config-ref="cf-storage-gateway" path="#[vars.signed.path]" requestStreamingMode="NEVER">
+                    <http:body>#[vars.content]</http:body>
+                    <http:headers><![CDATA[#[vars.signed.headers
+                        ++ (({ (vars.hostNameHeader default ''): vars.signingHost,
+                               (vars.accessIdHeader default ''): vars.accessId default '',
+                               (vars.accessSecretHeader default ''): vars.accessSecret default '' })
+                            filterObject ((v, k) -> !isEmpty(k as String) and !isEmpty(v)))
+                        ++ { 'Content-Type': vars.contentType }]]]></http:headers>
+                    <http:response-validator>
+                        <http:success-status-code-validator values="100..599"/>
+                    </http:response-validator>
+                </http:request>
+                <mule:error-handler>
+                    <mule:on-error-propagate type="HTTP:CONNECTIVITY, HTTP:TIMEOUT">
+                        <mule:raise-error type="CF-STORAGE:CONNECTIVITY" description="#[error.description]"/>
+                    </mule:on-error-propagate>
+                </mule:error-handler>
+            </mule:try>
+            <mule:choice>
+                <mule:when expression="#[attributes.statusCode &gt;= 300]">
+                    <tns:raise-storage-error backend="S3" method="PUT" key="#[vars.key]" statusCode="#[attributes.statusCode]"
+                                             responseBody="#[do { var r = dw::Runtime::try(() -&gt; payload.^raw as String) --- if (r.success) r.result else '' }]"
+                                             requestId="#[attributes.headers.'x-amz-request-id' default '']"/>
+                </mule:when>
+            </mule:choice>
+            <mule:set-payload value="#[output application/java --- {
+                key: vars.key,
+                eTag: attributes.headers.etag,
+                versionId: attributes.headers.'x-amz-version-id',
+                requestId: attributes.headers.'x-amz-request-id',
+                contentType: vars.contentType,
+                storageType: 'S3'
+            }]"/>
+        </body>
+        <output type="any"/>
+        <errors>
+            <error type="BAD_REQUEST"/>
+            <error type="CONNECTIVITY"/>
+            <error type="AUTHENTICATION"/>
+            <error type="GATEWAY_REJECTED"/>
+            <error type="INVALID_CREDENTIALS"/>
+            <error type="SIGNATURE_MISMATCH"/>
+            <error type="ACCESS_DENIED"/>
+            <error type="NOT_FOUND"/>
+            <error type="BAD_DIGEST"/>
+            <error type="SERVER_ERROR"/>
+        </errors>
+    </operation>
+
+    <operation name="s3-get" visibility="PRIVATE">
+        <parameters>
+            <parameter name="key" type="string"/>
+        </parameters>
+        <body>
+            <tns:s3-sign method="GET" key="#[vars.key]"/>
+            <mule:set-variable variableName="signed" value="#[payload]"/>
+            <mule:try>
+                <http:request method="GET" config-ref="cf-storage-gateway" path="#[vars.signed.path]">
+                    <http:headers><![CDATA[#[vars.signed.headers
+                        ++ (({ (vars.hostNameHeader default ''): vars.signingHost,
+                               (vars.accessIdHeader default ''): vars.accessId default '',
+                               (vars.accessSecretHeader default ''): vars.accessSecret default '' })
+                            filterObject ((v, k) -> !isEmpty(k as String) and !isEmpty(v)))]]]></http:headers>
+                    <http:response-validator>
+                        <http:success-status-code-validator values="100..599"/>
+                    </http:response-validator>
+                </http:request>
+                <mule:error-handler>
+                    <mule:on-error-propagate type="HTTP:CONNECTIVITY, HTTP:TIMEOUT">
+                        <mule:raise-error type="CF-STORAGE:CONNECTIVITY" description="#[error.description]"/>
+                    </mule:on-error-propagate>
+                </mule:error-handler>
+            </mule:try>
+            <!-- only on failure: the success path leaves payload (the object) and attributes untouched -->
+            <mule:choice>
+                <mule:when expression="#[attributes.statusCode &gt;= 300]">
+                    <tns:raise-storage-error backend="S3" method="GET" key="#[vars.key]" statusCode="#[attributes.statusCode]"
+                                             responseBody="#[do { var r = dw::Runtime::try(() -&gt; payload.^raw as String) --- if (r.success) r.result else '' }]"
+                                             requestId="#[attributes.headers.'x-amz-request-id' default '']"/>
+                </mule:when>
+            </mule:choice>
+        </body>
+        <output type="binary"/>
+        <output-attributes type="any"/>
+        <errors>
+            <error type="BAD_REQUEST"/>
+            <error type="CONNECTIVITY"/>
+            <error type="AUTHENTICATION"/>
+            <error type="GATEWAY_REJECTED"/>
+            <error type="INVALID_CREDENTIALS"/>
+            <error type="SIGNATURE_MISMATCH"/>
+            <error type="ACCESS_DENIED"/>
+            <error type="NOT_FOUND"/>
+            <error type="BAD_DIGEST"/>
+            <error type="SERVER_ERROR"/>
+        </errors>
+    </operation>
+
+    <operation name="s3-head" visibility="PRIVATE">
+        <parameters>
+            <parameter name="key" type="string"/>
+        </parameters>
+        <body>
+            <tns:s3-sign method="HEAD" key="#[vars.key]"/>
+            <mule:set-variable variableName="signed" value="#[payload]"/>
+            <mule:try>
+                <http:request method="HEAD" config-ref="cf-storage-gateway" path="#[vars.signed.path]">
+                    <http:headers><![CDATA[#[vars.signed.headers
+                        ++ (({ (vars.hostNameHeader default ''): vars.signingHost,
+                               (vars.accessIdHeader default ''): vars.accessId default '',
+                               (vars.accessSecretHeader default ''): vars.accessSecret default '' })
+                            filterObject ((v, k) -> !isEmpty(k as String) and !isEmpty(v)))]]]></http:headers>
+                    <http:response-validator>
+                        <http:success-status-code-validator values="100..599"/>
+                    </http:response-validator>
+                </http:request>
+                <mule:error-handler>
+                    <mule:on-error-propagate type="HTTP:CONNECTIVITY, HTTP:TIMEOUT">
+                        <mule:raise-error type="CF-STORAGE:CONNECTIVITY" description="#[error.description]"/>
+                    </mule:on-error-propagate>
+                </mule:error-handler>
+            </mule:try>
+            <mule:choice>
+                <mule:when expression="#[attributes.statusCode &gt;= 300]">
+                    <tns:raise-storage-error backend="S3" method="HEAD" key="#[vars.key]" statusCode="#[attributes.statusCode]"
+                                             requestId="#[attributes.headers.'x-amz-request-id' default '']"/>
+                </mule:when>
+            </mule:choice>
+            <mule:set-payload value="#[output application/java --- {
+                key: vars.key,
+                eTag: attributes.headers.etag,
+                contentType: attributes.headers.'content-type',
+                contentLength: if (attributes.headers.'content-length' != null) attributes.headers.'content-length' as Number else null,
+                lastModified: attributes.headers.'last-modified',
+                versionId: attributes.headers.'x-amz-version-id',
+                requestId: attributes.headers.'x-amz-request-id',
+                userMetadata: (attributes.headers filterObject ((v, k) -> (k as String) startsWith 'x-amz-meta-'))
+                              mapObject ((v, k) -> { ((k as String)[11 to -1]): v }),
+                storageType: 'S3'
+            }]"/>
+        </body>
+        <output type="any"/>
+        <errors>
+            <error type="BAD_REQUEST"/>
+            <error type="CONNECTIVITY"/>
+            <error type="AUTHENTICATION"/>
+            <error type="GATEWAY_REJECTED"/>
+            <error type="INVALID_CREDENTIALS"/>
+            <error type="SIGNATURE_MISMATCH"/>
+            <error type="ACCESS_DENIED"/>
+            <error type="NOT_FOUND"/>
+            <error type="BAD_DIGEST"/>
+            <error type="SERVER_ERROR"/>
+        </errors>
+    </operation>
+
+    <operation name="s3-delete" visibility="PRIVATE">
+        <parameters>
+            <parameter name="key" type="string"/>
+        </parameters>
+        <body>
+            <tns:s3-sign method="DELETE" key="#[vars.key]"/>
+            <mule:set-variable variableName="signed" value="#[payload]"/>
+            <mule:try>
+                <http:request method="DELETE" config-ref="cf-storage-gateway" path="#[vars.signed.path]">
+                    <http:headers><![CDATA[#[vars.signed.headers
+                        ++ (({ (vars.hostNameHeader default ''): vars.signingHost,
+                               (vars.accessIdHeader default ''): vars.accessId default '',
+                               (vars.accessSecretHeader default ''): vars.accessSecret default '' })
+                            filterObject ((v, k) -> !isEmpty(k as String) and !isEmpty(v)))]]]></http:headers>
+                    <http:response-validator>
+                        <http:success-status-code-validator values="100..599"/>
+                    </http:response-validator>
+                </http:request>
+                <mule:error-handler>
+                    <mule:on-error-propagate type="HTTP:CONNECTIVITY, HTTP:TIMEOUT">
+                        <mule:raise-error type="CF-STORAGE:CONNECTIVITY" description="#[error.description]"/>
+                    </mule:on-error-propagate>
+                </mule:error-handler>
+            </mule:try>
+            <mule:choice>
+                <mule:when expression="#[attributes.statusCode &gt;= 300]">
+                    <tns:raise-storage-error backend="S3" method="DELETE" key="#[vars.key]" statusCode="#[attributes.statusCode]"
+                                             responseBody="#[do { var r = dw::Runtime::try(() -&gt; payload.^raw as String) --- if (r.success) r.result else '' }]"
+                                             requestId="#[attributes.headers.'x-amz-request-id' default '']"/>
+                </mule:when>
+            </mule:choice>
+            <mule:set-payload value="#[{ key: vars.key, deleted: true, storageType: 'S3' }]"/>
+        </body>
+        <output type="any"/>
+        <errors>
+            <error type="BAD_REQUEST"/>
+            <error type="CONNECTIVITY"/>
+            <error type="AUTHENTICATION"/>
+            <error type="GATEWAY_REJECTED"/>
+            <error type="INVALID_CREDENTIALS"/>
+            <error type="SIGNATURE_MISMATCH"/>
+            <error type="ACCESS_DENIED"/>
+            <error type="NOT_FOUND"/>
+            <error type="BAD_DIGEST"/>
+            <error type="SERVER_ERROR"/>
+        </errors>
+    </operation>
+
+    <!-- ======================================================================================= ADLS private operations -->
+
+    <!-- Cached Entra token for Azure Storage { token, expiresAt }; refreshed 5 min before expiry. -->
+    <operation name="adls-token" visibility="PRIVATE">
+        <body>
+            <os:retrieve key="adls-token" objectStore="cf-storage-cache" target="cached">
+                <os:default-value>#[{}]</os:default-value>
+            </os:retrieve>
+            <mule:choice>
+                <mule:when expression="#[!isEmpty(vars.cached) and ((vars.cached.expiresAt as DateTime) &gt; (now() + |PT5M|))]">
+                    <mule:set-payload value="#[vars.cached]"/>
+                </mule:when>
+                <mule:otherwise>
+                    <tns:entra-token tokenScope="#[if (isEmpty(vars.adlsScope)) 'https://storage.azure.com/.default' else vars.adlsScope]"/>
+                    <os:store key="adls-token" objectStore="cf-storage-cache"/>
+                </mule:otherwise>
+            </mule:choice>
+        </body>
+        <output type="any"/>
+        <errors>
+            <error type="AUTHENTICATION"/>
+            <error type="CONNECTIVITY"/>
+        </errors>
+    </operation>
+
+    <!--
+        Everything an ADLS request needs: { host, path, headers }.
+        host    = <account>.blob.core.windows.net (Cloudflare forwards there)
+        path    = /<container>/<key>, each segment URI-encoded
+        headers = Bearer token + x-ms-version + x-ms-date + the cloudFlare* headers
+    -->
+    <operation name="adls-request" visibility="PRIVATE">
+        <parameters>
+            <parameter name="key" type="string"/>
+        </parameters>
+        <body>
+            <mule:set-variable variableName="cleanKey" value="#[(vars.key default '') replace /^\/+/ with '']"/>
+            <mule:choice>
+                <mule:when expression="#[isEmpty(trim(vars.cleanKey)) or (vars.cleanKey endsWith '/') or dw::core::Arrays::some(vars.cleanKey splitBy '/', (s) -&gt; s == '' or s == '.' or s == '..')]">
+                    <mule:raise-error type="CF-STORAGE:BAD_REQUEST"
+                                      description="#['Object key ' ++ write(vars.key default '', 'application/json') ++ ' is empty or has an empty, . or .. segment; proxies normalise these']"/>
+                </mule:when>
+            </mule:choice>
+            <tns:adls-token/>
+            <mule:set-variable variableName="token" value="#[payload.token]"/>
+            <mule:set-variable variableName="adlsHost"
+                               value="#[vars.adlsAccount ++ '.' ++ (if (isEmpty(vars.adlsEndpointSuffix)) 'blob.core.windows.net' else vars.adlsEndpointSuffix)]"/>
+            <mule:set-payload value="#[output application/java --- {
+                host: vars.adlsHost,
+                path: '/' ++ vars.adlsContainer ++ '/' ++ ((vars.cleanKey splitBy '/') map dw::core::URL::encodeURIComponent($) joinBy '/'),
+                headers: {
+                    'Authorization': 'Bearer ' ++ vars.token,
+                    'x-ms-version': if (isEmpty(vars.adlsApiVersion)) '2021-08-06' else vars.adlsApiVersion,
+                    'x-ms-date': (now() &gt;&gt; 'UTC') as String { format: &quot;EEE, dd MMM yyyy HH:mm:ss 'GMT'&quot;, locale: 'en' }
+                } ++ (({ (vars.hostNameHeader default ''): vars.adlsHost,
+                         (vars.accessIdHeader default ''): vars.accessId default '',
+                         (vars.accessSecretHeader default ''): vars.accessSecret default '' })
+                      filterObject ((v, k) -> !isEmpty(k as String) and !isEmpty(v)))
+            }]"/>
+        </body>
+        <output type="any"/>
+        <errors>
+            <error type="BAD_REQUEST"/>
+            <error type="AUTHENTICATION"/>
+            <error type="CONNECTIVITY"/>
+        </errors>
+    </operation>
+
+    <!-- Put Blob (one call, works on ADLS Gen2 accounts): 201 Created -->
+    <operation name="adls-put" visibility="PRIVATE">
+        <parameters>
+            <parameter name="key" type="string"/>
+            <parameter name="content" type="binary"/>
+            <parameter name="contentType" type="string"/>
+            <parameter name="userMetadata" type="any" use="OPTIONAL"/>
+        </parameters>
+        <body>
+            <!-- Azure metadata names must be valid C# identifiers -->
+            <mule:set-variable variableName="badNames"
+                               value="#[(vars.userMetadata default {}) pluck ($$ as String) filter ((n) -> !(n matches /[A-Za-z_][A-Za-z0-9_]*/))]"/>
+            <mule:choice>
+                <mule:when expression="#[!isEmpty(vars.badNames)]">
+                    <mule:raise-error type="CF-STORAGE:BAD_REQUEST"
+                                      description="#['ADLS metadata names must be letters, digits and _ (not starting with a digit): ' ++ (vars.badNames joinBy ', ')]"/>
+                </mule:when>
+            </mule:choice>
+            <tns:adls-request key="#[vars.key]"/>
+            <mule:set-variable variableName="req" value="#[payload]"/>
+            <mule:try>
+                <http:request method="PUT" config-ref="cf-storage-gateway" path="#[vars.req.path]" requestStreamingMode="NEVER">
+                    <http:body>#[vars.content]</http:body>
+                    <http:headers><![CDATA[#[vars.req.headers
+                        ++ { 'x-ms-blob-type': 'BlockBlob', 'Content-Type': vars.contentType }
+                        ++ ((vars.userMetadata default {}) mapObject ((v, k) -> { ('x-ms-meta-' ++ (k as String)): v as String }))]]]></http:headers>
+                    <http:response-validator>
+                        <http:success-status-code-validator values="100..599"/>
+                    </http:response-validator>
+                </http:request>
+                <mule:error-handler>
+                    <mule:on-error-propagate type="HTTP:CONNECTIVITY, HTTP:TIMEOUT">
+                        <mule:raise-error type="CF-STORAGE:CONNECTIVITY" description="#[error.description]"/>
+                    </mule:on-error-propagate>
+                </mule:error-handler>
+            </mule:try>
+            <mule:choice>
+                <mule:when expression="#[attributes.statusCode &gt;= 300]">
+                    <tns:raise-storage-error backend="ADLS" method="PUT" key="#[vars.key]" statusCode="#[attributes.statusCode]"
+                                             responseBody="#[do { var r = dw::Runtime::try(() -&gt; payload.^raw as String) --- if (r.success) r.result else '' }]"
+                                             errorCode="#[attributes.headers.'x-ms-error-code' default '']"
+                                             requestId="#[attributes.headers.'x-ms-request-id' default '']"/>
+                </mule:when>
+            </mule:choice>
+            <mule:set-payload value="#[output application/java --- {
+                key: vars.key,
+                eTag: attributes.headers.etag,
+                versionId: attributes.headers.'x-ms-version-id',
+                requestId: attributes.headers.'x-ms-request-id',
+                contentType: vars.contentType,
+                storageType: 'ADLS'
+            }]"/>
+        </body>
+        <output type="any"/>
+        <errors>
+            <error type="BAD_REQUEST"/>
+            <error type="CONNECTIVITY"/>
+            <error type="AUTHENTICATION"/>
+            <error type="GATEWAY_REJECTED"/>
+            <error type="INVALID_CREDENTIALS"/>
+            <error type="SIGNATURE_MISMATCH"/>
+            <error type="ACCESS_DENIED"/>
+            <error type="NOT_FOUND"/>
+            <error type="BAD_DIGEST"/>
+            <error type="SERVER_ERROR"/>
+        </errors>
+    </operation>
+
+    <!-- Get Blob: 200 -->
+    <operation name="adls-get" visibility="PRIVATE">
+        <parameters>
+            <parameter name="key" type="string"/>
+        </parameters>
+        <body>
+            <tns:adls-request key="#[vars.key]"/>
+            <mule:set-variable variableName="req" value="#[payload]"/>
+            <mule:try>
+                <http:request method="GET" config-ref="cf-storage-gateway" path="#[vars.req.path]">
+                    <http:headers>#[vars.req.headers]</http:headers>
+                    <http:response-validator>
+                        <http:success-status-code-validator values="100..599"/>
+                    </http:response-validator>
+                </http:request>
+                <mule:error-handler>
+                    <mule:on-error-propagate type="HTTP:CONNECTIVITY, HTTP:TIMEOUT">
+                        <mule:raise-error type="CF-STORAGE:CONNECTIVITY" description="#[error.description]"/>
+                    </mule:on-error-propagate>
+                </mule:error-handler>
+            </mule:try>
+            <mule:choice>
+                <mule:when expression="#[attributes.statusCode &gt;= 300]">
+                    <tns:raise-storage-error backend="ADLS" method="GET" key="#[vars.key]" statusCode="#[attributes.statusCode]"
+                                             responseBody="#[do { var r = dw::Runtime::try(() -&gt; payload.^raw as String) --- if (r.success) r.result else '' }]"
+                                             errorCode="#[attributes.headers.'x-ms-error-code' default '']"
+                                             requestId="#[attributes.headers.'x-ms-request-id' default '']"/>
+                </mule:when>
+            </mule:choice>
+        </body>
+        <output type="binary"/>
+        <output-attributes type="any"/>
+        <errors>
+            <error type="BAD_REQUEST"/>
+            <error type="CONNECTIVITY"/>
+            <error type="AUTHENTICATION"/>
+            <error type="GATEWAY_REJECTED"/>
+            <error type="INVALID_CREDENTIALS"/>
+            <error type="SIGNATURE_MISMATCH"/>
+            <error type="ACCESS_DENIED"/>
+            <error type="NOT_FOUND"/>
+            <error type="BAD_DIGEST"/>
+            <error type="SERVER_ERROR"/>
+        </errors>
+    </operation>
+
+    <!-- Get Blob Properties: 200 -->
+    <operation name="adls-head" visibility="PRIVATE">
+        <parameters>
+            <parameter name="key" type="string"/>
+        </parameters>
+        <body>
+            <tns:adls-request key="#[vars.key]"/>
+            <mule:set-variable variableName="req" value="#[payload]"/>
+            <mule:try>
+                <http:request method="HEAD" config-ref="cf-storage-gateway" path="#[vars.req.path]">
+                    <http:headers>#[vars.req.headers]</http:headers>
+                    <http:response-validator>
+                        <http:success-status-code-validator values="100..599"/>
+                    </http:response-validator>
+                </http:request>
+                <mule:error-handler>
+                    <mule:on-error-propagate type="HTTP:CONNECTIVITY, HTTP:TIMEOUT">
+                        <mule:raise-error type="CF-STORAGE:CONNECTIVITY" description="#[error.description]"/>
+                    </mule:on-error-propagate>
+                </mule:error-handler>
+            </mule:try>
+            <mule:choice>
+                <mule:when expression="#[attributes.statusCode &gt;= 300]">
+                    <tns:raise-storage-error backend="ADLS" method="HEAD" key="#[vars.key]" statusCode="#[attributes.statusCode]"
+                                             errorCode="#[attributes.headers.'x-ms-error-code' default '']"
+                                             requestId="#[attributes.headers.'x-ms-request-id' default '']"/>
+                </mule:when>
+            </mule:choice>
+            <mule:set-payload value="#[output application/java --- {
+                key: vars.key,
+                eTag: attributes.headers.etag,
+                contentType: attributes.headers.'content-type',
+                contentLength: if (attributes.headers.'content-length' != null) attributes.headers.'content-length' as Number else null,
+                lastModified: attributes.headers.'last-modified',
+                versionId: attributes.headers.'x-ms-version-id',
+                requestId: attributes.headers.'x-ms-request-id',
+                userMetadata: (attributes.headers filterObject ((v, k) -> (k as String) startsWith 'x-ms-meta-'))
+                              mapObject ((v, k) -> { ((k as String)[10 to -1]): v }),
+                storageType: 'ADLS'
+            }]"/>
+        </body>
+        <output type="any"/>
+        <errors>
+            <error type="BAD_REQUEST"/>
+            <error type="CONNECTIVITY"/>
+            <error type="AUTHENTICATION"/>
+            <error type="GATEWAY_REJECTED"/>
+            <error type="INVALID_CREDENTIALS"/>
+            <error type="SIGNATURE_MISMATCH"/>
+            <error type="ACCESS_DENIED"/>
+            <error type="NOT_FOUND"/>
+            <error type="BAD_DIGEST"/>
+            <error type="SERVER_ERROR"/>
+        </errors>
+    </operation>
+
+    <!-- Delete Blob: 202 Accepted. A missing blob (404) counts as success, the same as S3. -->
+    <operation name="adls-delete" visibility="PRIVATE">
+        <parameters>
+            <parameter name="key" type="string"/>
+        </parameters>
+        <body>
+            <tns:adls-request key="#[vars.key]"/>
+            <mule:set-variable variableName="req" value="#[payload]"/>
+            <mule:try>
+                <http:request method="DELETE" config-ref="cf-storage-gateway" path="#[vars.req.path]">
+                    <http:headers>#[vars.req.headers]</http:headers>
+                    <http:response-validator>
+                        <http:success-status-code-validator values="100..599"/>
+                    </http:response-validator>
+                </http:request>
+                <mule:error-handler>
+                    <mule:on-error-propagate type="HTTP:CONNECTIVITY, HTTP:TIMEOUT">
+                        <mule:raise-error type="CF-STORAGE:CONNECTIVITY" description="#[error.description]"/>
+                    </mule:on-error-propagate>
+                </mule:error-handler>
+            </mule:try>
+            <mule:choice>
+                <mule:when expression="#[attributes.statusCode &gt;= 300 and !(attributes.statusCode == 404 and (attributes.headers.'x-ms-error-code' default '') == 'BlobNotFound')]">
+                    <tns:raise-storage-error backend="ADLS" method="DELETE" key="#[vars.key]" statusCode="#[attributes.statusCode]"
+                                             responseBody="#[do { var r = dw::Runtime::try(() -&gt; payload.^raw as String) --- if (r.success) r.result else '' }]"
+                                             errorCode="#[attributes.headers.'x-ms-error-code' default '']"
+                                             requestId="#[attributes.headers.'x-ms-request-id' default '']"/>
+                </mule:when>
+            </mule:choice>
+            <mule:set-payload value="#[{ key: vars.key, deleted: true, storageType: 'ADLS' }]"/>
+        </body>
+        <output type="any"/>
+        <errors>
+            <error type="BAD_REQUEST"/>
+            <error type="CONNECTIVITY"/>
+            <error type="AUTHENTICATION"/>
+            <error type="GATEWAY_REJECTED"/>
+            <error type="INVALID_CREDENTIALS"/>
+            <error type="SIGNATURE_MISMATCH"/>
+            <error type="ACCESS_DENIED"/>
+            <error type="NOT_FOUND"/>
+            <error type="BAD_DIGEST"/>
+            <error type="SERVER_ERROR"/>
+        </errors>
+    </operation>
+</module>
